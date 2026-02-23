@@ -22,9 +22,13 @@ class DataIngestor:
         self.data_dir = Path(data_dir)
         self.conn = duckdb.connect()
         
-        # Configure DuckDB for memory efficiency
-        self.conn.execute("SET memory_limit='8GB'")
-        self.conn.execute("SET threads=4")
+        # Configure DuckDB for minimal memory with aggressive disk spillover
+        self.conn.execute("SET memory_limit='1GB'")
+        self.conn.execute("SET threads=1")
+        self.conn.execute("SET temp_directory='/tmp/duckdb_temp'")
+        self.conn.execute("SET max_temp_directory_size='5GB'")
+        self.conn.execute("SET preserve_insertion_order=false")
+        self.conn.execute("SET checkpoint_threshold='256MB'")
         
     def load_spending_data(self) -> None:
         """Load HHS Medicaid Provider Spending parquet."""
@@ -74,15 +78,19 @@ class DataIngestor:
                 NPI,
                 STATE,
                 EXCLTYPE,
-                -- Parse dates from YYYYMMDD format
+                -- Parse dates from YYYYMMDD format (cast to VARCHAR, filter invalid)
                 CASE 
-                    WHEN EXCLDATE IS NOT NULL AND LENGTH(EXCLDATE) = 8 
-                    THEN strptime(EXCLDATE, '%Y%m%d')::DATE
+                    WHEN EXCLDATE IS NOT NULL 
+                         AND LENGTH(CAST(EXCLDATE AS VARCHAR)) = 8 
+                         AND CAST(EXCLDATE AS VARCHAR) != '00000000'
+                    THEN strptime(CAST(EXCLDATE AS VARCHAR), '%Y%m%d')::DATE
                     ELSE NULL
                 END AS EXCLDATE,
                 CASE 
-                    WHEN REINDATE IS NOT NULL AND LENGTH(REINDATE) = 8 
-                    THEN strptime(REINDATE, '%Y%m%d')::DATE
+                    WHEN REINDATE IS NOT NULL 
+                         AND LENGTH(CAST(REINDATE AS VARCHAR)) = 8 
+                         AND CAST(REINDATE AS VARCHAR) != '00000000'
+                    THEN strptime(CAST(REINDATE AS VARCHAR), '%Y%m%d')::DATE
                     ELSE NULL
                 END AS REINDATE
             FROM read_csv_auto('{leie_path}', header=true, ignore_errors=true)
@@ -121,6 +129,7 @@ class DataIngestor:
         logger.info(f"Loading NPPES data from {nppes_csv}")
         
         # Load only required columns (10 out of 329)
+        # Note: Read full CSV then select needed columns (DuckDB optimizes this)
         self.conn.execute(f"""
             CREATE OR REPLACE TABLE nppes AS
             SELECT 
@@ -139,21 +148,9 @@ class DataIngestor:
                 '{nppes_csv}', 
                 header=true, 
                 ignore_errors=true,
-                columns={{
-                    'NPI': 'VARCHAR',
-                    'Entity Type Code': 'VARCHAR',
-                    'Provider Organization Name (Legal Business Name)': 'VARCHAR',
-                    'Provider Last Name (Legal Name)': 'VARCHAR',
-                    'Provider First Name': 'VARCHAR',
-                    'Provider Business Practice Location Address State Name': 'VARCHAR',
-                    'Provider Business Practice Location Address Postal Code': 'VARCHAR',
-                    'Healthcare Provider Taxonomy Code_1': 'VARCHAR',
-                    'Provider Enumeration Date': 'VARCHAR',
-                    'Authorized Official Last Name': 'VARCHAR',
-                    'Authorized Official First Name': 'VARCHAR'
-                }}
+                all_varchar=true
             )
-            WHERE NPI IS NOT NULL
+            WHERE "NPI" IS NOT NULL
         """)
         
         count = self.conn.execute("SELECT COUNT(*) FROM nppes").fetchone()[0]

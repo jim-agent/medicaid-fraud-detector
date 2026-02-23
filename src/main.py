@@ -8,12 +8,37 @@ CLI tool that analyzes HHS Medicaid spending data to detect fraud signals.
 import argparse
 import logging
 import sys
+import os
+import resource
+import platform
 from pathlib import Path
 from datetime import datetime
 
 from .ingest import DataIngestor
 from .signals import SignalDetector
 from .output import ReportGenerator
+
+
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB."""
+    if platform.system() == 'Linux':
+        # More accurate on Linux
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024  # KB to MB
+    # Fallback using resource module
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_maxrss / 1024  # KB to MB on Linux
+
+
+def get_peak_memory_mb() -> float:
+    """Get peak memory usage in MB."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # ru_maxrss is in KB on Linux, bytes on macOS
+    if platform.system() == 'Darwin':
+        return usage.ru_maxrss / (1024 * 1024)
+    return usage.ru_maxrss / 1024
 
 # Configure logging
 logging.basicConfig(
@@ -110,13 +135,32 @@ Examples:
         generator = ReportGenerator(conn)
         report = generator.generate_report(signals, args.output)
         
-        # Summary
+        # Collect resource metrics
         elapsed = datetime.now() - start_time
+        peak_memory_mb = get_peak_memory_mb()
+        current_memory_mb = get_memory_usage_mb()
+        
+        # Add resource metrics to report
+        report['execution_metrics'] = {
+            'total_runtime_seconds': round(elapsed.total_seconds(), 2),
+            'total_runtime_human': str(elapsed),
+            'peak_memory_mb': round(peak_memory_mb, 2),
+            'final_memory_mb': round(current_memory_mb, 2),
+            'platform': platform.system(),
+            'python_version': platform.python_version(),
+            'cpu_count': os.cpu_count(),
+        }
+        
+        # Re-write report with metrics
+        generator.write_report(report, args.output)
+        
+        # Summary
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY")
         logger.info("=" * 60)
         logger.info(f"Total runtime: {elapsed}")
+        logger.info(f"Peak memory: {peak_memory_mb:.2f} MB")
         logger.info(f"Providers scanned: {report['total_providers_scanned']:,}")
         logger.info(f"Providers flagged: {report['total_providers_flagged']:,}")
         logger.info("")

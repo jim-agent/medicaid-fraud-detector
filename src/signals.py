@@ -67,8 +67,8 @@ class SignalDetector:
                 WHERE l.NPI IS NOT NULL 
                     AND l.NPI != ''
                     AND l.EXCLDATE IS NOT NULL
-                    AND CAST(s.CLAIM_FROM_MONTH AS DATE) >= CAST(l.EXCLDATE AS DATE)
-                    AND (l.REINDATE IS NULL OR CAST(s.CLAIM_FROM_MONTH AS DATE) < CAST(l.REINDATE AS DATE))
+                    AND CAST(s.CLAIM_FROM_MONTH || '-01' AS DATE) >= l.EXCLDATE
+                    AND (l.REINDATE IS NULL OR CAST(s.CLAIM_FROM_MONTH || '-01' AS DATE) < l.REINDATE)
                 GROUP BY s.BILLING_PROVIDER_NPI_NUM, l.EXCLDATE, l.EXCLTYPE, l.REINDATE
                 
                 UNION
@@ -86,8 +86,8 @@ class SignalDetector:
                 WHERE l.NPI IS NOT NULL 
                     AND l.NPI != ''
                     AND l.EXCLDATE IS NOT NULL
-                    AND CAST(s.CLAIM_FROM_MONTH AS DATE) >= CAST(l.EXCLDATE AS DATE)
-                    AND (l.REINDATE IS NULL OR CAST(s.CLAIM_FROM_MONTH AS DATE) < CAST(l.REINDATE AS DATE))
+                    AND CAST(s.CLAIM_FROM_MONTH || '-01' AS DATE) >= l.EXCLDATE
+                    AND (l.REINDATE IS NULL OR CAST(s.CLAIM_FROM_MONTH || '-01' AS DATE) < l.REINDATE)
                 GROUP BY s.SERVICING_PROVIDER_NPI_NUM, l.EXCLDATE, l.EXCLTYPE, l.REINDATE
             )
             SELECT * FROM excluded_billing
@@ -219,7 +219,7 @@ class SignalDetector:
                 JOIN nppes n ON pfb.npi = n.npi
                 WHERE n.enumeration_date IS NOT NULL
                     AND TRY_CAST(n.enumeration_date AS DATE) IS NOT NULL
-                    AND pfb.first_billing_month <= TRY_CAST(n.enumeration_date AS DATE) + INTERVAL '24 months'
+                    AND CAST(pfb.first_billing_month || '-01' AS DATE) <= TRY_CAST(n.enumeration_date AS DATE) + INTERVAL '24 months'
             ),
             monthly_billing AS (
                 SELECT 
@@ -322,36 +322,37 @@ class SignalDetector:
         """
         logger.info("Detecting Signal 4: Workforce Impossibility")
         
+        # Optimized: aggregate max per NPI directly without window functions
         results = self.conn.execute("""
-            WITH monthly_claims AS (
+            WITH org_npis AS (
+                SELECT npi FROM nppes WHERE entity_type_code = '2'
+            ),
+            monthly_claims AS (
                 SELECT 
                     s.BILLING_PROVIDER_NPI_NUM AS npi,
                     s.CLAIM_FROM_MONTH,
                     SUM(s.TOTAL_CLAIMS) AS month_claims,
                     SUM(s.TOTAL_PAID) AS month_paid
                 FROM spending s
-                JOIN nppes n ON s.BILLING_PROVIDER_NPI_NUM = n.npi
-                WHERE n.entity_type_code = '2'  -- Organizations only
+                WHERE s.BILLING_PROVIDER_NPI_NUM IN (SELECT npi FROM org_npis)
                 GROUP BY s.BILLING_PROVIDER_NPI_NUM, s.CLAIM_FROM_MONTH
+                HAVING SUM(s.TOTAL_CLAIMS) > 1056
             ),
-            peak_months AS (
+            max_per_npi AS (
                 SELECT 
                     npi,
-                    CLAIM_FROM_MONTH AS peak_month,
-                    month_claims AS peak_claims,
-                    month_paid AS peak_paid,
-                    month_claims / 22.0 / 8.0 AS claims_per_hour,
-                    ROW_NUMBER() OVER (PARTITION BY npi ORDER BY month_claims DESC) AS rn
+                    MAX(month_claims) AS max_claims
                 FROM monthly_claims
+                GROUP BY npi
             )
             SELECT 
-                npi,
-                peak_month,
-                peak_claims,
-                peak_paid,
-                claims_per_hour
-            FROM peak_months
-            WHERE rn = 1 AND claims_per_hour > 6
+                mc.npi,
+                mc.CLAIM_FROM_MONTH AS peak_month,
+                mc.month_claims AS peak_claims,
+                mc.month_paid AS peak_paid,
+                mc.month_claims / 22.0 / 8.0 AS claims_per_hour
+            FROM monthly_claims mc
+            JOIN max_per_npi m ON mc.npi = m.npi AND mc.month_claims = m.max_claims
             ORDER BY claims_per_hour DESC
         """).fetchall()
         

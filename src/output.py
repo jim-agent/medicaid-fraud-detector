@@ -263,3 +263,9 @@ class ReportGenerator:
         logger.info(f"Total providers flagged: {len(flagged_providers):,}")
         
         return report
+    
+    def write_report(self, report: Dict[str, Any], output_path: str) -> None:
+        """Write or re-write report to file (e.g., to add execution metrics)."""
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        logger.info(f"Report updated with execution metrics: {output_path}")

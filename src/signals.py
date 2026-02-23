@@ -257,7 +257,7 @@ class SignalDetector:
                 total_billing
             FROM provider_totals
             ORDER BY peak_growth DESC
-            LIMIT 5000
+
         """).fetchall()
         
         signals = []
@@ -335,7 +335,7 @@ class SignalDetector:
             FROM monthly_claims mc
             JOIN max_per_npi m ON mc.npi = m.npi AND mc.month_claims = m.max_claims
             ORDER BY claims_per_hour DESC
-            LIMIT 5000
+
         """).fetchall()
         
         # Cleanup
@@ -421,7 +421,7 @@ class SignalDetector:
             HAVING COUNT(DISTINCT o.npi) >= 5
                 AND SUM(COALESCE(nt.total_paid, 0)) > 1000000
             ORDER BY combined_total DESC
-            LIMIT 5000
+
         """).fetchall()
         
         # Cleanup temp tables

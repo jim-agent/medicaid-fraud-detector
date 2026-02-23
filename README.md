@@ -127,6 +127,26 @@ This is a **data source characteristic**, not an analysis limitation. We correct
 - **Peer group minimum**: ≥10 providers required for statistical significance
 - **All flagged providers unique**: Zero duplicate NPIs in output
 
+
+## Future Enhancements
+
+### Signal 7: Excluded Individual Controls Billing Organization (Not Implemented)
+
+**Potential detection:** Cross-reference excluded individuals (without NPIs) against NPPES Authorized Official fields to find organizations controlled by excluded persons.
+
+| Analysis | Count |
+|----------|-------|
+| Excluded individuals without NPI | 71,384 |
+| NPPES orgs with Authorized Officials | 1,787,658 |
+| Potential matches (name + state) | **4,717** |
+
+**Why not implemented:**
+- Name matching has false positive risk (common names)
+- Would require additional verification (middle name, address, business correlation)
+- Not in competition specification
+
+**Data is available:** NPPES contains Authorized Official Last Name, First Name, and organization state - sufficient for fuzzy matching with appropriate validation.
+
 ## Quick Start
 
 ```bash

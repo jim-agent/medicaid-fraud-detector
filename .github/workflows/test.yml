@@ -1,0 +1,108 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  test-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest duckdb
+          
+      - name: Run unit tests
+        run: pytest tests/test_signals.py -v
+
+  test-macos:
+    runs-on: macos-14  # Apple Silicon (M1)
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest duckdb
+          
+      - name: Run unit tests
+        run: pytest tests/test_signals.py -v
+          
+      - name: Test setup.sh runs (no data download)
+        run: |
+          # Verify setup.sh is executable and has valid syntax
+          bash -n setup.sh
+          chmod +x setup.sh
+          echo "setup.sh syntax OK"
+          
+      - name: Test run.sh syntax
+        run: |
+          bash -n run.sh
+          chmod +x run.sh
+          echo "run.sh syntax OK"
+
+  # Full integration test with real data (manual trigger only due to size)
+  integration-macos:
+    runs-on: macos-14
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Check available resources
+        run: |
+          echo "=== System Info ==="
+          sysctl -n machdep.cpu.brand_string || echo "CPU info unavailable"
+          sysctl -n hw.memsize | awk '{print "RAM: " $1/1024/1024/1024 " GB"}'
+          df -h .
+          
+      - name: Run setup.sh (downloads ~4GB)
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+        timeout-minutes: 30
+          
+      - name: Run fraud detection
+        run: |
+          chmod +x run.sh
+          time ./run.sh
+        timeout-minutes: 240  # 4 hour limit
+          
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fraud-signals-macos
+          path: fraud_signals.json
+          
+      - name: Report metrics
+        run: |
+          echo "=== Output Stats ==="
+          ls -lh fraud_signals.json
+          python3 -c "
+          import json
+          with open('fraud_signals.json') as f:
+              data = json.load(f)
+          print(f'Providers flagged: {data[\"total_providers_flagged\"]}')
+          print(f'Runtime: {data.get(\"execution_metrics\", {}).get(\"total_runtime\", \"N/A\")}')
+          print(f'Peak memory: {data.get(\"execution_metrics\", {}).get(\"peak_memory_mb\", \"N/A\")} MB')
+          "

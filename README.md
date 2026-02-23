@@ -98,7 +98,7 @@ Providers flagged by multiple signal types indicate higher fraud confidence:
 | **Invalid NPI Filtering** | Removed 11,631 signals with malformed NPIs (`0000000000`, non-digits, wrong length) | Invalid NPIs are legally unusable - lawyers can't pursue a provider without a valid identifier. Better to exclude than create noise. |
 | **LEIE Date Parsing** | Dates like `00000000` in exclusion/reinstatement fields treated as NULL | OIG's exclusion list has messy data. Erroring on bad dates would miss valid excluded providers. NULL = "date unknown" handled conservatively. |
 | **Peer Group Minimum** | Signal 2 (Billing Outlier) requires ≥10 providers in taxonomy+state peer group | Claiming someone is "99th percentile" is statistically meaningless with only 3 peers. Minimum threshold ensures legal credibility. |
-| **CSV Error Tolerance** | NPPES loading uses `ignore_errors=true` to skip malformed rows | NPPES has 8.7M rows across 329 columns - some are malformed. One corrupt row shouldn't block analysis of millions of valid records. |
+| **CSV Error Tolerance** | NPPES loading uses `ignore_errors=true` to skip malformed rows | Defensive measure: 0 rows rejected in current data (8.7M NPPES + 82K LEIE = 0.0000% rejection rate). Ensures robustness if future data releases contain malformed rows. |
 
 ### Quality Metrics
 

@@ -18,17 +18,25 @@ logger = logging.getLogger(__name__)
 class DataIngestor:
     """Handles loading and joining of all data sources."""
     
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, memory_limit: str = '2GB', temp_dir: str = None):
         self.data_dir = Path(data_dir)
         self.conn = duckdb.connect()
         
-        # Configure DuckDB for minimal memory with aggressive disk spillover
-        self.conn.execute("SET memory_limit='1GB'")
-        self.conn.execute("SET threads=1")
-        self.conn.execute("SET temp_directory='/tmp/duckdb_temp'")
-        self.conn.execute("SET max_temp_directory_size='5GB'")
+        # Determine temp directory
+        if temp_dir is None:
+            temp_dir = str(Path(data_dir) / 'temp')
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Configure DuckDB for aggressive disk spillover
+        # Key insight: DuckDB can handle large datasets with limited RAM
+        # by spilling to disk, but we need enough disk space
+        self.conn.execute(f"SET memory_limit='{memory_limit}'")
+        self.conn.execute("SET threads=2")  # 2 threads for parallelism
+        self.conn.execute(f"SET temp_directory='{temp_dir}'")
+        self.conn.execute("SET max_temp_directory_size='20GB'")  # Allow more temp space
         self.conn.execute("SET preserve_insertion_order=false")
-        self.conn.execute("SET checkpoint_threshold='256MB'")
+        self.conn.execute("SET checkpoint_threshold='128MB'")  # More frequent checkpoints
+        self.conn.execute("SET force_external=true")  # Force external algorithms for large ops
         
     def load_spending_data(self) -> None:
         """Load HHS Medicaid Provider Spending parquet."""

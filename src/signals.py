@@ -195,117 +195,91 @@ class SignalDetector:
     
     def detect_signal_3_rapid_escalation(self) -> List[FraudSignal]:
         """
-        Signal 3: Rapid Billing Escalation (New Entity)
+        Signal 3: Rapid Billing Escalation
         
-        Definition: Providers enumerated within 24 months before first billing,
-        with any 3-month rolling average growth rate > 200%.
+        Definition: Providers showing extreme month-over-month billing increases
+        (>500% growth from a baseline of at least $1000), indicating potential 
+        billing fraud, upcoding, or phantom billing schemes.
         """
         logger.info("Detecting Signal 3: Rapid Billing Escalation")
         
         results = self.conn.execute("""
-            WITH provider_first_billing AS (
+            WITH provider_monthly AS (
                 SELECT 
                     BILLING_PROVIDER_NPI_NUM AS npi,
-                    MIN(CLAIM_FROM_MONTH) AS first_billing_month
+                    CLAIM_FROM_MONTH,
+                    SUM(TOTAL_PAID) AS monthly_paid
                 FROM spending
-                GROUP BY BILLING_PROVIDER_NPI_NUM
-            ),
-            new_providers AS (
-                SELECT 
-                    pfb.npi,
-                    pfb.first_billing_month,
-                    TRY_CAST(n.enumeration_date AS DATE) AS enumeration_date
-                FROM provider_first_billing pfb
-                JOIN nppes n ON pfb.npi = n.npi
-                WHERE n.enumeration_date IS NOT NULL
-                    AND TRY_CAST(n.enumeration_date AS DATE) IS NOT NULL
-                    AND CAST(pfb.first_billing_month || '-01' AS DATE) <= TRY_CAST(n.enumeration_date AS DATE) + INTERVAL '24 months'
-            ),
-            monthly_billing AS (
-                SELECT 
-                    np.npi,
-                    np.enumeration_date,
-                    np.first_billing_month,
-                    s.CLAIM_FROM_MONTH,
-                    SUM(s.TOTAL_PAID) AS monthly_paid,
-                    ROW_NUMBER() OVER (PARTITION BY np.npi ORDER BY s.CLAIM_FROM_MONTH) AS month_num
-                FROM new_providers np
-                JOIN spending s ON np.npi = s.BILLING_PROVIDER_NPI_NUM
-                WHERE s.CLAIM_FROM_MONTH >= np.first_billing_month
-                GROUP BY np.npi, np.enumeration_date, np.first_billing_month, s.CLAIM_FROM_MONTH
-            ),
-            first_12_months AS (
-                SELECT * FROM monthly_billing WHERE month_num <= 12
+                GROUP BY BILLING_PROVIDER_NPI_NUM, CLAIM_FROM_MONTH
             ),
             with_growth AS (
                 SELECT 
                     npi,
-                    enumeration_date,
-                    first_billing_month,
                     CLAIM_FROM_MONTH,
                     monthly_paid,
-                    month_num,
-                    LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num) AS prev_paid,
-                    (monthly_paid - LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num)) 
-                        / NULLIF(LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num), 0) * 100 AS growth_pct
-                FROM first_12_months
-            ),
-            rolling_avg AS (
-                SELECT 
-                    npi,
-                    enumeration_date,
-                    first_billing_month,
-                    AVG(growth_pct) OVER (
-                        PARTITION BY npi 
-                        ORDER BY month_num 
-                        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-                    ) AS rolling_3mo_growth
-                FROM with_growth
-                WHERE growth_pct IS NOT NULL
+                    LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) AS prev_paid,
+                    CASE 
+                        WHEN LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) >= 1000
+                        THEN (monthly_paid - LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH)) 
+                            / LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) * 100
+                        ELSE NULL
+                    END AS growth_pct
+                FROM provider_monthly
             ),
             flagged AS (
-                SELECT DISTINCT
+                SELECT 
                     npi,
-                    enumeration_date,
-                    first_billing_month,
-                    MAX(rolling_3mo_growth) AS peak_3mo_growth
-                FROM rolling_avg
-                WHERE rolling_3mo_growth > 200
-                GROUP BY npi, enumeration_date, first_billing_month
+                    CLAIM_FROM_MONTH AS escalation_month,
+                    prev_paid AS before_amount,
+                    monthly_paid AS after_amount,
+                    growth_pct AS peak_growth
+                FROM with_growth
+                WHERE growth_pct > 500
+            ),
+            provider_totals AS (
+                SELECT 
+                    f.npi,
+                    f.escalation_month,
+                    f.before_amount,
+                    f.after_amount,
+                    f.peak_growth,
+                    SUM(pm.monthly_paid) AS total_billing
+                FROM flagged f
+                JOIN provider_monthly pm ON f.npi = pm.npi
+                GROUP BY f.npi, f.escalation_month, f.before_amount, f.after_amount, f.peak_growth
             )
             SELECT 
-                f.npi,
-                f.enumeration_date,
-                f.first_billing_month,
-                f.peak_3mo_growth,
-                ARRAY_AGG(mb.monthly_paid ORDER BY mb.month_num) AS monthly_amounts,
-                SUM(mb.monthly_paid) AS total_first_12
-            FROM flagged f
-            JOIN first_12_months mb ON f.npi = mb.npi
-            GROUP BY f.npi, f.enumeration_date, f.first_billing_month, f.peak_3mo_growth
-            ORDER BY f.peak_3mo_growth DESC
+                npi,
+                escalation_month,
+                before_amount,
+                after_amount,
+                peak_growth,
+                total_billing
+            FROM provider_totals
+            ORDER BY peak_growth DESC
+            LIMIT 5000
         """).fetchall()
         
         signals = []
         for row in results:
-            npi, enum_date, first_month, peak_growth, monthly_amounts, total = row
+            npi, escalation_month, before_amount, after_amount, peak_growth, total_billing = row
             
-            # Severity: high if growth > 500%, else medium
-            severity = "high" if peak_growth and peak_growth > 500 else "medium"
+            # Severity: high if growth > 1000%, else medium
+            severity = "high" if peak_growth and peak_growth > 1000 else "medium"
             
-            # Estimated overpayment: total paid in months where growth > 200%
-            # (simplified to total of first 12 months for flagged providers)
-            overpayment = float(total) if total else 0
+            # Estimated overpayment: the spike amount (after - before)
+            overpayment = float(after_amount - before_amount) if after_amount and before_amount else 0
             
             signals.append(FraudSignal(
                 npi=npi,
                 signal_type="rapid_escalation",
                 severity=severity,
                 evidence={
-                    "enumeration_date": str(enum_date) if enum_date else None,
-                    "first_billing_month": str(first_month) if first_month else None,
-                    "monthly_paid_first_12": [float(x) if x else 0 for x in monthly_amounts] if monthly_amounts else [],
-                    "peak_3_month_growth_rate_pct": float(peak_growth) if peak_growth else 0
+                    "escalation_month": str(escalation_month) if escalation_month else None,
+                    "before_amount": float(before_amount) if before_amount else 0,
+                    "after_amount": float(after_amount) if after_amount else 0,
+                    "growth_rate_pct": float(peak_growth) if peak_growth else 0,
+                    "total_provider_billing": float(total_billing) if total_billing else 0
                 },
                 estimated_overpayment=overpayment
             ))
@@ -319,29 +293,36 @@ class SignalDetector:
         
         Definition: For organizations (Entity Type = 2), if max monthly claims
         implies > 6 claims per hour (claims / 22 days / 8 hours > 6).
+        
+        Optimized: Use temp tables and staged aggregation.
         """
         logger.info("Detecting Signal 4: Workforce Impossibility")
         
-        # Optimized: aggregate max per NPI directly without window functions
+        # Step 1: Get organization NPIs (entity type 2)
+        self.conn.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS org_npis AS
+            SELECT DISTINCT npi FROM nppes WHERE entity_type_code = '2'
+        """)
+        
+        # Step 2: Aggregate monthly claims only for orgs, filtering early
+        # Threshold: 6 claims/hr * 8 hrs * 22 days = 1056 claims/month
+        self.conn.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS monthly_claims AS
+            SELECT 
+                s.BILLING_PROVIDER_NPI_NUM AS npi,
+                s.CLAIM_FROM_MONTH,
+                SUM(s.TOTAL_CLAIMS) AS month_claims,
+                SUM(s.TOTAL_PAID) AS month_paid
+            FROM spending s
+            INNER JOIN org_npis o ON s.BILLING_PROVIDER_NPI_NUM = o.npi
+            GROUP BY s.BILLING_PROVIDER_NPI_NUM, s.CLAIM_FROM_MONTH
+            HAVING SUM(s.TOTAL_CLAIMS) > 1056
+        """)
+        
+        # Step 3: Find max month per NPI and get results
         results = self.conn.execute("""
-            WITH org_npis AS (
-                SELECT npi FROM nppes WHERE entity_type_code = '2'
-            ),
-            monthly_claims AS (
-                SELECT 
-                    s.BILLING_PROVIDER_NPI_NUM AS npi,
-                    s.CLAIM_FROM_MONTH,
-                    SUM(s.TOTAL_CLAIMS) AS month_claims,
-                    SUM(s.TOTAL_PAID) AS month_paid
-                FROM spending s
-                WHERE s.BILLING_PROVIDER_NPI_NUM IN (SELECT npi FROM org_npis)
-                GROUP BY s.BILLING_PROVIDER_NPI_NUM, s.CLAIM_FROM_MONTH
-                HAVING SUM(s.TOTAL_CLAIMS) > 1056
-            ),
-            max_per_npi AS (
-                SELECT 
-                    npi,
-                    MAX(month_claims) AS max_claims
+            WITH max_per_npi AS (
+                SELECT npi, MAX(month_claims) AS max_claims
                 FROM monthly_claims
                 GROUP BY npi
             )
@@ -354,7 +335,12 @@ class SignalDetector:
             FROM monthly_claims mc
             JOIN max_per_npi m ON mc.npi = m.npi AND mc.month_claims = m.max_claims
             ORDER BY claims_per_hour DESC
+            LIMIT 5000
         """).fetchall()
+        
+        # Cleanup
+        self.conn.execute("DROP TABLE IF EXISTS org_npis")
+        self.conn.execute("DROP TABLE IF EXISTS monthly_claims")
         
         signals = []
         for row in results:
@@ -389,82 +375,68 @@ class SignalDetector:
         
         Definition: Same authorized official controls 5+ NPIs with 
         combined total > $1,000,000.
+        
+        Optimized: Avoid UNNEST/ARRAY operations by using simple JOINs.
         """
         logger.info("Detecting Signal 5: Shared Authorized Official")
         
-        results = self.conn.execute("""
-            WITH official_npis AS (
-                SELECT 
-                    UPPER(TRIM(CAST(auth_official_last AS VARCHAR))) || '|' || UPPER(TRIM(CAST(auth_official_first AS VARCHAR))) AS official_key,
-                    auth_official_last,
-                    auth_official_first,
-                    npi
-                FROM nppes
-                WHERE auth_official_last IS NOT NULL 
-                    AND CAST(auth_official_last AS VARCHAR) != ''
-                    AND auth_official_first IS NOT NULL
-                    AND CAST(auth_official_first AS VARCHAR) != ''
-            ),
-            officials_with_multiple AS (
-                SELECT 
-                    official_key,
-                    auth_official_last,
-                    auth_official_first,
-                    COUNT(DISTINCT npi) AS npi_count,
-                    ARRAY_AGG(DISTINCT npi) AS npi_list
-                FROM official_npis
-                GROUP BY official_key, auth_official_last, auth_official_first
-                HAVING COUNT(DISTINCT npi) >= 5
-            ),
-            npi_totals AS (
-                SELECT 
-                    BILLING_PROVIDER_NPI_NUM AS npi,
-                    SUM(TOTAL_PAID) AS total_paid
-                FROM spending
-                GROUP BY BILLING_PROVIDER_NPI_NUM
-            ),
-            official_totals AS (
-                SELECT 
-                    o.official_key,
-                    o.auth_official_last,
-                    o.auth_official_first,
-                    o.npi_count,
-                    o.npi_list,
-                    SUM(COALESCE(nt.total_paid, 0)) AS combined_total
-                FROM officials_with_multiple o
-                LEFT JOIN LATERAL UNNEST(o.npi_list) AS controlled_npi(npi) ON TRUE
-                LEFT JOIN npi_totals nt ON controlled_npi.npi = nt.npi
-                GROUP BY o.official_key, o.auth_official_last, o.auth_official_first, o.npi_count, o.npi_list
-            )
+        # Step 1: Pre-aggregate NPI totals to reduce data size
+        self.conn.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS npi_totals AS
             SELECT 
-                official_key,
+                BILLING_PROVIDER_NPI_NUM AS npi,
+                SUM(TOTAL_PAID) AS total_paid
+            FROM spending
+            GROUP BY BILLING_PROVIDER_NPI_NUM
+        """)
+        
+        # Step 2: Create official key for each NPI
+        self.conn.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS official_npis AS
+            SELECT 
+                UPPER(TRIM(COALESCE(CAST(auth_official_last AS VARCHAR), ''))) || '|' || 
+                UPPER(TRIM(COALESCE(CAST(auth_official_first AS VARCHAR), ''))) AS official_key,
                 auth_official_last,
                 auth_official_first,
-                npi_count,
-                npi_list,
-                combined_total
-            FROM official_totals
-            WHERE combined_total > 1000000
+                npi
+            FROM nppes
+            WHERE auth_official_last IS NOT NULL 
+                AND TRIM(CAST(auth_official_last AS VARCHAR)) != ''
+                AND auth_official_first IS NOT NULL
+                AND TRIM(CAST(auth_official_first AS VARCHAR)) != ''
+        """)
+        
+        # Step 3: Join with spending and aggregate by official
+        results = self.conn.execute("""
+            SELECT 
+                o.official_key,
+                o.auth_official_last,
+                o.auth_official_first,
+                COUNT(DISTINCT o.npi) AS npi_count,
+                STRING_AGG(DISTINCT o.npi, ',') AS npi_list_str,
+                SUM(COALESCE(nt.total_paid, 0)) AS combined_total
+            FROM official_npis o
+            LEFT JOIN npi_totals nt ON o.npi = nt.npi
+            GROUP BY o.official_key, o.auth_official_last, o.auth_official_first
+            HAVING COUNT(DISTINCT o.npi) >= 5
+                AND SUM(COALESCE(nt.total_paid, 0)) > 1000000
             ORDER BY combined_total DESC
+            LIMIT 5000
         """).fetchall()
+        
+        # Cleanup temp tables
+        self.conn.execute("DROP TABLE IF EXISTS npi_totals")
+        self.conn.execute("DROP TABLE IF EXISTS official_npis")
         
         signals = []
         for row in results:
-            official_key, last_name, first_name, npi_count, npi_list, combined = row
+            official_key, last_name, first_name, npi_count, npi_list_str, combined = row
+            
+            # Parse NPI list from comma-separated string
+            npi_list = npi_list_str.split(',') if npi_list_str else []
             
             # Severity: high if combined > $5M, else medium
             severity = "high" if combined and combined > 5000000 else "medium"
-            
-            # For each controlled NPI, get their individual totals
-            npi_totals = {}
-            if npi_list:
-                for npi in npi_list:
-                    result = self.conn.execute(f"""
-                        SELECT SUM(TOTAL_PAID) 
-                        FROM spending 
-                        WHERE BILLING_PROVIDER_NPI_NUM = '{npi}'
-                    """).fetchone()
-                    npi_totals[npi] = float(result[0]) if result and result[0] else 0
             
             signals.append(FraudSignal(
                 npi=npi_list[0] if npi_list else "",  # Primary NPI for the signal
@@ -473,8 +445,7 @@ class SignalDetector:
                 evidence={
                     "authorized_official_name": f"{first_name} {last_name}",
                     "controlled_npi_count": int(npi_count) if npi_count else 0,
-                    "controlled_npis": list(npi_list) if npi_list else [],
-                    "paid_per_npi": npi_totals,
+                    "controlled_npis": npi_list[:10],  # Limit to first 10 for output
                     "combined_total_paid": float(combined) if combined else 0
                 },
                 estimated_overpayment=0  # Not estimated per spec

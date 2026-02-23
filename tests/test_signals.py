@@ -47,7 +47,7 @@ class TestSignal1ExcludedProvider:
             CREATE TABLE leie AS
             SELECT * FROM (VALUES
                 ('DOE', 'JOHN', NULL, NULL, NULL, NULL, '1234567890', 'NY', '1128A1', 
-                 DATE '2023-01-01', NULL)
+                 DATE '2023-01-01', CAST(NULL AS DATE))
             ) AS t(LASTNAME, FIRSTNAME, MIDNAME, BUSNAME, GENERAL, SPECIALTY, NPI, 
                    STATE, EXCLTYPE, EXCLDATE, REINDATE)
         """)

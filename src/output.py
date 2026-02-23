@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 # Version of this tool
 TOOL_VERSION = "1.0.0"
 
+
+def is_valid_npi(npi: str) -> bool:
+    """Validate NPI format (10 digits, not all zeros)."""
+    if not npi or len(npi) != 10:
+        return False
+    if not npi.isdigit():
+        return False
+    if npi == "0000000000":
+        return False
+    return True
+
 # FCA statute mappings per signal type
 STATUTE_MAPPING = {
     "excluded_provider": "31 U.S.C. § 3729(a)(1)(A)",
@@ -166,13 +177,20 @@ class ReportGenerator:
             "SELECT COUNT(DISTINCT BILLING_PROVIDER_NPI_NUM) FROM spending"
         ).fetchone()[0]
         
-        # Aggregate signals by provider
+        # Aggregate signals by provider, filtering invalid NPIs
         provider_signals: Dict[str, List[FraudSignal]] = {}
+        invalid_npi_count = 0
         for signal_type, signals in signals_by_type.items():
             for signal in signals:
+                if not is_valid_npi(signal.npi):
+                    invalid_npi_count += 1
+                    continue
                 if signal.npi not in provider_signals:
                     provider_signals[signal.npi] = []
                 provider_signals[signal.npi].append(signal)
+        
+        if invalid_npi_count > 0:
+            logger.info(f"Filtered out {invalid_npi_count} signals with invalid NPIs")
         
         logger.info(f"Building report for {len(provider_signals)} flagged providers...")
         

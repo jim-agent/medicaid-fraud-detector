@@ -211,19 +211,22 @@ class SignalDetector:
                 GROUP BY BILLING_PROVIDER_NPI_NUM
             ),
             -- Join with NPPES to get enumeration date, filter to "new" providers
+            -- NPPES date format is MM/DD/YYYY, need to parse with strptime
             new_providers AS (
                 SELECT 
                     pfb.npi,
                     pfb.first_billing_month,
-                    n.enumeration_date
+                    n.enumeration_date,
+                    TRY_STRPTIME(n.enumeration_date, '%m/%d/%Y') AS enum_date_parsed,
+                    CAST(pfb.first_billing_month || '-01' AS DATE) AS first_billing_date
                 FROM provider_first_billing pfb
                 INNER JOIN nppes n ON pfb.npi = n.npi
                 WHERE n.enumeration_date IS NOT NULL
-                    AND TRY_CAST(n.enumeration_date AS DATE) IS NOT NULL
+                    AND TRY_STRPTIME(n.enumeration_date, '%m/%d/%Y') IS NOT NULL
                     -- Enumerated within 24 months BEFORE first billing
-                    AND TRY_CAST(n.enumeration_date AS DATE) >= 
+                    AND TRY_STRPTIME(n.enumeration_date, '%m/%d/%Y') >= 
                         (CAST(pfb.first_billing_month || '-01' AS DATE) - INTERVAL '24 months')
-                    AND TRY_CAST(n.enumeration_date AS DATE) <= 
+                    AND TRY_STRPTIME(n.enumeration_date, '%m/%d/%Y') <= 
                         CAST(pfb.first_billing_month || '-01' AS DATE)
             ),
             -- Get monthly billing for first 12 months only

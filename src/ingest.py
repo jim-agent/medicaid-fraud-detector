@@ -36,7 +36,11 @@ class DataIngestor:
         self.conn.execute("SET max_temp_directory_size='20GB'")  # Allow more temp space
         self.conn.execute("SET preserve_insertion_order=false")
         self.conn.execute("SET checkpoint_threshold='128MB'")  # More frequent checkpoints
-        self.conn.execute("SET force_external=true")  # Force external algorithms for large ops
+        # Try to enable external algorithms (DuckDB 0.9+ only)
+        try:
+            self.conn.execute("SET force_external=true")
+        except Exception:
+            pass  # Older DuckDB versions don't support this
         
     def load_spending_data(self) -> None:
         """Load HHS Medicaid Provider Spending parquet."""

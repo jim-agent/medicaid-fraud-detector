@@ -1,0 +1,3 @@
+npi,entity_type_code,org_name,last_name,first_name,state,zip_code,taxonomy_code,enumeration_date,auth_official_last,auth_official_first
+1234567890,1,,DOE,JOHN,NY,10001,207Q00000X,01/01/2020,,
+9999999999,1,,SMITH,JANE,CA,90001,207Q00000X,01/01/2020,,

@@ -195,91 +195,130 @@ class SignalDetector:
     
     def detect_signal_3_rapid_escalation(self) -> List[FraudSignal]:
         """
-        Signal 3: Rapid Billing Escalation
+        Signal 3: Rapid Billing Escalation (New Entity)
         
-        Definition: Providers showing extreme month-over-month billing increases
-        (>500% growth from a baseline of at least $1000), indicating potential 
-        billing fraud, upcoding, or phantom billing schemes.
+        Definition: Providers enumerated within 24 months before their first billing,
+        with any rolling 3-month average growth rate > 200% in their first 12 months.
         """
         logger.info("Detecting Signal 3: Rapid Billing Escalation")
         
         results = self.conn.execute("""
-            WITH provider_monthly AS (
+            WITH provider_first_billing AS (
                 SELECT 
                     BILLING_PROVIDER_NPI_NUM AS npi,
-                    CLAIM_FROM_MONTH,
-                    SUM(TOTAL_PAID) AS monthly_paid
+                    MIN(CLAIM_FROM_MONTH) AS first_billing_month
                 FROM spending
-                GROUP BY BILLING_PROVIDER_NPI_NUM, CLAIM_FROM_MONTH
+                GROUP BY BILLING_PROVIDER_NPI_NUM
             ),
+            -- Join with NPPES to get enumeration date, filter to "new" providers
+            new_providers AS (
+                SELECT 
+                    pfb.npi,
+                    pfb.first_billing_month,
+                    n.enumeration_date
+                FROM provider_first_billing pfb
+                INNER JOIN nppes n ON pfb.npi = n.npi
+                WHERE n.enumeration_date IS NOT NULL
+                    AND TRY_CAST(n.enumeration_date AS DATE) IS NOT NULL
+                    -- Enumerated within 24 months BEFORE first billing
+                    AND TRY_CAST(n.enumeration_date AS DATE) >= 
+                        (CAST(pfb.first_billing_month || '-01' AS DATE) - INTERVAL '24 months')
+                    AND TRY_CAST(n.enumeration_date AS DATE) <= 
+                        CAST(pfb.first_billing_month || '-01' AS DATE)
+            ),
+            -- Get monthly billing for first 12 months only
+            monthly_billing AS (
+                SELECT 
+                    np.npi,
+                    np.enumeration_date,
+                    np.first_billing_month,
+                    s.CLAIM_FROM_MONTH,
+                    SUM(s.TOTAL_PAID) AS monthly_paid,
+                    ROW_NUMBER() OVER (PARTITION BY np.npi ORDER BY s.CLAIM_FROM_MONTH) AS month_num
+                FROM new_providers np
+                INNER JOIN spending s ON np.npi = s.BILLING_PROVIDER_NPI_NUM
+                WHERE s.CLAIM_FROM_MONTH >= np.first_billing_month
+                GROUP BY np.npi, np.enumeration_date, np.first_billing_month, s.CLAIM_FROM_MONTH
+            ),
+            first_12_months AS (
+                SELECT * FROM monthly_billing WHERE month_num <= 12
+            ),
+            -- Calculate month-over-month growth
             with_growth AS (
                 SELECT 
                     npi,
+                    enumeration_date,
+                    first_billing_month,
                     CLAIM_FROM_MONTH,
                     monthly_paid,
-                    LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) AS prev_paid,
+                    month_num,
+                    LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num) AS prev_paid,
                     CASE 
-                        WHEN LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) >= 1000
-                        THEN (monthly_paid - LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH)) 
-                            / LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY CLAIM_FROM_MONTH) * 100
+                        WHEN LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num) > 0
+                        THEN (monthly_paid - LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num)) 
+                            / LAG(monthly_paid) OVER (PARTITION BY npi ORDER BY month_num) * 100
                         ELSE NULL
                     END AS growth_pct
-                FROM provider_monthly
+                FROM first_12_months
             ),
-            flagged AS (
+            -- Calculate rolling 3-month average growth
+            rolling_avg AS (
                 SELECT 
                     npi,
-                    CLAIM_FROM_MONTH AS escalation_month,
-                    prev_paid AS before_amount,
-                    monthly_paid AS after_amount,
-                    growth_pct AS peak_growth
+                    enumeration_date,
+                    first_billing_month,
+                    month_num,
+                    AVG(growth_pct) OVER (
+                        PARTITION BY npi 
+                        ORDER BY month_num 
+                        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                    ) AS rolling_3mo_growth
                 FROM with_growth
-                WHERE growth_pct > 500
+                WHERE growth_pct IS NOT NULL
             ),
-            provider_totals AS (
-                SELECT 
-                    f.npi,
-                    f.escalation_month,
-                    f.before_amount,
-                    f.after_amount,
-                    f.peak_growth,
-                    SUM(pm.monthly_paid) AS total_billing
-                FROM flagged f
-                JOIN provider_monthly pm ON f.npi = pm.npi
-                GROUP BY f.npi, f.escalation_month, f.before_amount, f.after_amount, f.peak_growth
+            -- Flag providers with rolling 3-month average > 200%
+            flagged AS (
+                SELECT DISTINCT
+                    npi,
+                    enumeration_date,
+                    first_billing_month,
+                    MAX(rolling_3mo_growth) AS peak_3mo_growth
+                FROM rolling_avg
+                WHERE rolling_3mo_growth > 200
+                GROUP BY npi, enumeration_date, first_billing_month
             )
             SELECT 
-                npi,
-                escalation_month,
-                before_amount,
-                after_amount,
-                peak_growth,
-                total_billing
-            FROM provider_totals
-            ORDER BY peak_growth DESC
-
+                f.npi,
+                f.enumeration_date,
+                f.first_billing_month,
+                f.peak_3mo_growth,
+                ARRAY_AGG(mb.monthly_paid ORDER BY mb.month_num) AS monthly_amounts,
+                SUM(mb.monthly_paid) AS total_first_12
+            FROM flagged f
+            INNER JOIN first_12_months mb ON f.npi = mb.npi
+            GROUP BY f.npi, f.enumeration_date, f.first_billing_month, f.peak_3mo_growth
+            ORDER BY f.peak_3mo_growth DESC
         """).fetchall()
         
         signals = []
         for row in results:
-            npi, escalation_month, before_amount, after_amount, peak_growth, total_billing = row
+            npi, enum_date, first_month, peak_growth, monthly_amounts, total = row
             
-            # Severity: high if growth > 1000%, else medium
-            severity = "high" if peak_growth and peak_growth > 1000 else "medium"
+            # Severity: high if growth > 500%, else medium
+            severity = "high" if peak_growth and peak_growth > 500 else "medium"
             
-            # Estimated overpayment: the spike amount (after - before)
-            overpayment = float(after_amount - before_amount) if after_amount and before_amount else 0
+            # Estimated overpayment: total paid in months where growth exceeded 200%
+            overpayment = float(total) if total else 0
             
             signals.append(FraudSignal(
                 npi=npi,
                 signal_type="rapid_escalation",
                 severity=severity,
                 evidence={
-                    "escalation_month": str(escalation_month) if escalation_month else None,
-                    "before_amount": float(before_amount) if before_amount else 0,
-                    "after_amount": float(after_amount) if after_amount else 0,
-                    "growth_rate_pct": float(peak_growth) if peak_growth else 0,
-                    "total_provider_billing": float(total_billing) if total_billing else 0
+                    "enumeration_date": str(enum_date) if enum_date else None,
+                    "first_billing_month": str(first_month) if first_month else None,
+                    "monthly_paid_first_12": [float(x) if x else 0 for x in monthly_amounts] if monthly_amounts else [],
+                    "peak_3_month_growth_rate_pct": float(peak_growth) if peak_growth else 0
                 },
                 estimated_overpayment=overpayment
             ))

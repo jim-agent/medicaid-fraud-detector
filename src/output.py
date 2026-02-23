@@ -174,11 +174,76 @@ class ReportGenerator:
                     provider_signals[signal.npi] = []
                 provider_signals[signal.npi].append(signal)
         
+        logger.info(f"Building report for {len(provider_signals)} flagged providers...")
+        
+        # Batch fetch provider info and totals for efficiency
+        # Get unique NPIs
+        unique_npis = list(provider_signals.keys())
+        logger.info(f"Batch fetching provider info for {len(unique_npis)} providers...")
+        
+        # Create temp table with flagged NPIs for efficient joins
+        self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS flagged_npis (npi VARCHAR PRIMARY KEY)")
+        # Insert in batches
+        batch_size = 10000
+        for i in range(0, len(unique_npis), batch_size):
+            batch = unique_npis[i:i+batch_size]
+            values = ", ".join([f"('{npi}')" for npi in batch])
+            self.conn.execute(f"INSERT OR IGNORE INTO flagged_npis VALUES {values}")
+        
+        # Batch fetch provider info
+        provider_info_map = {}
+        results = self.conn.execute("""
+            SELECT 
+                n.npi,
+                COALESCE(n.org_name, n.last_name || ', ' || n.first_name) AS provider_name,
+                CASE WHEN n.entity_type_code = '1' THEN 'individual' ELSE 'organization' END AS entity_type,
+                n.taxonomy_code,
+                n.state,
+                n.enumeration_date
+            FROM nppes n
+            INNER JOIN flagged_npis f ON n.npi = f.npi
+        """).fetchall()
+        for row in results:
+            provider_info_map[row[0]] = {
+                "npi": row[0], "provider_name": row[1], "entity_type": row[2],
+                "taxonomy_code": row[3], "state": row[4], "enumeration_date": row[5]
+            }
+        logger.info(f"Fetched info for {len(provider_info_map)} providers")
+        
+        # Batch fetch provider totals
+        provider_totals_map = {}
+        results = self.conn.execute("""
+            SELECT 
+                s.BILLING_PROVIDER_NPI_NUM,
+                SUM(s.TOTAL_PAID),
+                SUM(s.TOTAL_CLAIMS),
+                SUM(s.TOTAL_UNIQUE_BENEFICIARIES)
+            FROM spending s
+            INNER JOIN flagged_npis f ON s.BILLING_PROVIDER_NPI_NUM = f.npi
+            GROUP BY s.BILLING_PROVIDER_NPI_NUM
+        """).fetchall()
+        for row in results:
+            provider_totals_map[row[0]] = {
+                "total_paid_all_time": float(row[1]) if row[1] else 0,
+                "total_claims_all_time": int(row[2]) if row[2] else 0,
+                "total_unique_beneficiaries_all_time": int(row[3]) if row[3] else 0
+            }
+        logger.info(f"Fetched totals for {len(provider_totals_map)} providers")
+        
+        # Cleanup temp table
+        self.conn.execute("DROP TABLE IF EXISTS flagged_npis")
+        
         # Build flagged providers list
         flagged_providers = []
         for npi, signals in provider_signals.items():
-            provider_info = self.get_provider_info(npi)
-            provider_totals = self.get_provider_totals(npi)
+            provider_info = provider_info_map.get(npi, {
+                "npi": npi, "provider_name": "Unknown", "entity_type": "unknown",
+                "taxonomy_code": None, "state": None, "enumeration_date": None
+            })
+            provider_totals = provider_totals_map.get(npi, {
+                "total_paid_all_time": 0, "total_claims_all_time": 0,
+                "total_unique_beneficiaries_all_time": 0
+            })
             
             # Calculate total estimated overpayment
             total_overpayment = sum(s.estimated_overpayment for s in signals)
